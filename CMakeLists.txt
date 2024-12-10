@@ -19,6 +19,8 @@ add_executable(main src/main.c)
 target_link_libraries( main
     pico_stdlib
     pico_multicore
+
+    hardware_adc
 )
 
 # Add the standard include files to the build
