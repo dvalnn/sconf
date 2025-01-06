@@ -1,7 +1,6 @@
 #include <pico.h>
 #include <pico/multicore.h>
 #include <pico/stdio.h>
-#include <pico/sync.h>
 
 #include <hardware/adc.h>
 #include <hardware/gpio.h>
@@ -20,13 +19,22 @@
 
 #define GPIO_OUT_RELAY 22
 
+#define GPIO_HEARTBEAT_IN 12
+#define GPIO_HEARTBEAT_OUT 21
+
+#define GPIO_MALFUNCTION_LED 20
+
 #define TEMPERATURE_MIN 1250
 #define TEMPERATURE_MAX 3620
 
 #define WATCHDOG_MS 1000
 
-static struct mutex in_mtx;
-static struct mutex out_mtx;
+#define MISSING_HEARTBEAT_TIMEOUT_MS 2000
+#define MALFUNCTION_TIMEOUT_MS 2000
+#define UNSAFE_TIMEOUT_MS 10000
+
+volatile bool send_heartbeat = false;
+volatile uint64_t last_heartbeat_time = 0;
 
 struct DigitalSensor {
   const uint normal_pin;
@@ -74,6 +82,13 @@ uint16_t map(uint16_t x, uint16_t in_min, uint16_t in_max, uint16_t out_min,
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
 }
 
+void heartbeat_detect_callback(uint gpio, uint32_t events) {
+  (void)gpio;
+  (void)events;
+
+  last_heartbeat_time = time_us_64();
+}
+
 void setup_hardware() {
   watchdog_enable(WATCHDOG_MS, false);
   stdio_init_all();
@@ -95,36 +110,93 @@ void setup_hardware() {
   gpio_set_dir(GPIO_WATER_SENS_2_NC, GPIO_IN);
   gpio_pull_down(GPIO_WATER_SENS_2_NC);
 
-  adc_init();
+  gpio_init(GPIO_HEARTBEAT_IN);
+  gpio_set_dir(GPIO_HEARTBEAT_IN, GPIO_IN);
+  gpio_pull_down(GPIO_HEARTBEAT_IN);
 
+  adc_init();
   adc_gpio_init(GPIO_TEMP_SENS_1);
   adc_gpio_init(GPIO_TEMP_SENS_2);
 
   gpio_init(GPIO_OUT_RELAY);
   gpio_set_dir(GPIO_OUT_RELAY, GPIO_OUT);
   gpio_put(GPIO_OUT_RELAY, false);
+
+  gpio_init(GPIO_HEARTBEAT_OUT);
+  gpio_set_dir(GPIO_HEARTBEAT_OUT, GPIO_OUT);
+  gpio_put(GPIO_HEARTBEAT_OUT, false);
+
+  gpio_init(GPIO_MALFUNCTION_LED);
+  gpio_set_dir(GPIO_MALFUNCTION_LED, GPIO_OUT);
+
+  gpio_set_irq_enabled_with_callback(GPIO_HEARTBEAT_IN,
+                                     GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
+                                     true, heartbeat_detect_callback);
 };
 
-void safety_func(uint16_t temperature, bool water, bool malfunction) {
-  char *water_msg = water ? "ON" : "OFF";
+void safety_func(uint16_t temperature, bool water, bool maybe_malfunction) {
+  static bool malfunction = false;
+  static uint64_t last_ok_time = 0;
+
+  static bool unsafe = false;
+  static uint64_t last_safe_time = 0;
+
+  static bool heartbeat_fail = false;
+
   if (malfunction) {
     gpio_put(GPIO_OUT_RELAY, false);
+    gpio_put(GPIO_MALFUNCTION_LED, true);
+    send_heartbeat = false;
+    // TODO: Trigger malfunction LED
     printf("[Core 0] malfunction detected!\n");
-  } else if (!water && temperature >= 70) {
+    return;
+  }
+
+  char *water_msg = water ? "ON" : "OFF";
+  if (unsafe) {
     gpio_put(GPIO_OUT_RELAY, false);
-    printf("[Core 0] unsafe! temp: %d, water: %s\n", temperature, water_msg);
+    send_heartbeat = false;
+    printf("[Core 0] Unsafe latch triggered: temp: %d, water: %s!\n",
+           temperature, water_msg);
+    return;
+  }
+
+  if (heartbeat_fail) {
+    gpio_put(GPIO_OUT_RELAY, false);
+    send_heartbeat = false;
+    printf("[Core 0] Heartbeat failure!\n");
+    return;
+  }
+
+  bool maybe_unsafe = !water && temperature >= 70;
+
+  if (maybe_malfunction) {
+    if (time_us_64() - last_ok_time >= MALFUNCTION_TIMEOUT_MS * 1000) {
+      malfunction = true;
+      return;
+    }
   } else {
-    gpio_put(GPIO_OUT_RELAY, true);
-    printf("[Core 0] safe! temp: %d, water: %s\n", temperature, water_msg);
+    last_ok_time = time_us_64();
   }
+
+  if (maybe_unsafe) {
+    if (time_us_64() - last_safe_time >= UNSAFE_TIMEOUT_MS * 1000) {
+      unsafe = true;
+      return;
+    }
+  } else {
+    last_safe_time = time_us_64();
+  }
+
+  if (time_us_64() - last_heartbeat_time >=
+      MISSING_HEARTBEAT_TIMEOUT_MS * 1000) {
+    heartbeat_fail = true;
+    return;
+  }
+
+  gpio_put(GPIO_OUT_RELAY, true); // everything is fine
+  send_heartbeat = true;
 }
-
-void core_1_main() {
-
-  while (1) {
-    tight_loop_contents();
-  }
-};
 
 void core_0_main() {
   struct DigitalSensor water1 = {
@@ -149,8 +221,23 @@ void core_0_main() {
       .max_valid = TEMPERATURE_MAX,
   };
 
+  bool heartbeat = false;
+  uint64_t last_heartbeat_time = 0;
+  const uint64_t heartbeat_half_period_ms = 500;
+
   for (;;) {
-    bool malfunction = false;
+    if (send_heartbeat &&
+        time_us_64() - last_heartbeat_time >= heartbeat_half_period_ms * 1000) {
+      last_heartbeat_time = time_us_64();
+      gpio_put(GPIO_HEARTBEAT_OUT, heartbeat);
+      heartbeat = !heartbeat;
+    }
+
+    if (!send_heartbeat) {
+      gpio_put(GPIO_HEARTBEAT_OUT, false);
+    }
+
+    bool maybe_malfunction = false;
 
     ds_check_read(&water1);
     ds_check_read(&water2);
@@ -161,33 +248,33 @@ void core_0_main() {
     // check water consistency
     if (!water1.is_valid) {
       printf("[Core 0] water1 failure\n");
-      malfunction = true;
+      maybe_malfunction = true;
     }
 
     if (!water2.is_valid) {
       printf("[Core 0] water2 failure\n");
-      malfunction = true;
+      maybe_malfunction = true;
     }
 
     if (water1.value != water2.value) {
       printf("[Core 0] water reading inconsistent\n");
-      malfunction = true;
+      maybe_malfunction = true;
     }
 
     // check temperature consistency
     if (!temp1.is_valid) {
       printf("[Core 0] temp1 failure: %d\n", temp1.value);
-      malfunction = true;
+      maybe_malfunction = true;
     }
 
     if (!temp2.is_valid) {
       printf("[Core 0] temp2 failure: %d\n", temp2.value);
-      malfunction = true;
+      maybe_malfunction = true;
     }
 
     if (!is_within_10_percent(temp1.value, temp2.value)) {
       printf("[Core 0] temperature reading inconsistent\n");
-      malfunction = true;
+      maybe_malfunction = true;
     }
 
     uint16_t temp_real_1 =
@@ -196,7 +283,7 @@ void core_0_main() {
         map(temp2.value, temp2.min_valid, temp2.max_valid, 0, 100);
     uint16_t temperature = MAX(temp_real_1, temp_real_2);
 
-    safety_func(temperature, water1.value, malfunction);
+    safety_func(temperature, water1.value, maybe_malfunction);
 
     stdio_flush();
     watchdog_update();
@@ -214,11 +301,6 @@ int main() {
     printf("normal boot\n");
   }
   stdio_flush();
-
-  mutex_init(&in_mtx);
-  mutex_init(&out_mtx);
-
-  /* multicore_launch_core1(core_1_main); */
 
   core_0_main();
 }

@@ -42,8 +42,8 @@ target_compile_options( main PUBLIC
 pico_set_program_name(main "pico_sconf_c_sdk")
 pico_set_program_version(main "0.1")
 
-pico_enable_stdio_uart(main 1)
-pico_enable_stdio_usb(main 0)
+pico_enable_stdio_uart(main 0)
+pico_enable_stdio_usb(main 1)
 
 pico_add_extra_outputs(main)
 
